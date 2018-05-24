@@ -15,19 +15,14 @@
 #ifndef STORAGE_LEVELDB_INCLUDE_ITERATOR_H_
 #define STORAGE_LEVELDB_INCLUDE_ITERATOR_H_
 
-#include "leveldb/export.h"
 #include "leveldb/slice.h"
 #include "leveldb/status.h"
 
 namespace leveldb {
 
-class LEVELDB_EXPORT Iterator {
+class Iterator {
  public:
   Iterator();
-
-  Iterator(const Iterator&) = delete;
-  Iterator& operator=(const Iterator&) = delete;
-
   virtual ~Iterator();
 
   // An iterator is either positioned at a key/value pair, or
@@ -88,13 +83,17 @@ class LEVELDB_EXPORT Iterator {
     Cleanup* next;
   };
   Cleanup cleanup_;
+
+  // No copying allowed
+  Iterator(const Iterator&);
+  void operator=(const Iterator&);
 };
 
 // Return an empty iterator (yields nothing).
-LEVELDB_EXPORT Iterator* NewEmptyIterator();
+extern Iterator* NewEmptyIterator();
 
 // Return an empty iterator with the specified status.
-LEVELDB_EXPORT Iterator* NewErrorIterator(const Status& status);
+extern Iterator* NewErrorIterator(const Status& status);
 
 }  // namespace leveldb
 

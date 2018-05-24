@@ -5,10 +5,11 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "db/db_impl.h"
+#include "db/version_set.h"
 #include "leveldb/cache.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
-#include "leveldb/filter_policy.h"
 #include "leveldb/write_batch.h"
 #include "port/port.h"
 #include "util/crc32c.h"
@@ -83,14 +84,6 @@ static bool FLAGS_histogram = false;
 // (initialized to default value by "main")
 static int FLAGS_write_buffer_size = 0;
 
-// Number of bytes written to each file.
-// (initialized to default value by "main")
-static int FLAGS_max_file_size = 0;
-
-// Approximate size of user data packed per block (before compression.
-// (initialized to default value by "main")
-static int FLAGS_block_size = 0;
-
 // Number of bytes to use as a cache of uncompressed data.
 // Negative means use default settings.
 static int FLAGS_cache_size = -1;
@@ -111,12 +104,11 @@ static bool FLAGS_use_existing_db = false;
 static bool FLAGS_reuse_logs = false;
 
 // Use the db with the following name.
-static const char* FLAGS_db = nullptr;
+static const char* FLAGS_db = NULL;
 
 namespace leveldb {
 
 namespace {
-leveldb::Env* g_env = nullptr;
 
 // Helper for quickly generating random data.
 class RandomGenerator {
@@ -194,7 +186,7 @@ class Stats {
     done_ = 0;
     bytes_ = 0;
     seconds_ = 0;
-    start_ = g_env->NowMicros();
+    start_ = Env::Default()->NowMicros();
     finish_ = start_;
     message_.clear();
   }
@@ -212,7 +204,7 @@ class Stats {
   }
 
   void Stop() {
-    finish_ = g_env->NowMicros();
+    finish_ = Env::Default()->NowMicros();
     seconds_ = (finish_ - start_) * 1e-6;
   }
 
@@ -222,7 +214,7 @@ class Stats {
 
   void FinishedSingleOp() {
     if (FLAGS_histogram) {
-      double now = g_env->NowMicros();
+      double now = Env::Default()->NowMicros();
       double micros = now - last_op_finish_;
       hist_.Add(micros);
       if (micros > 20000) {
@@ -282,8 +274,8 @@ class Stats {
 // State shared by all concurrent executions of the same benchmark.
 struct SharedState {
   port::Mutex mu;
-  port::CondVar cv GUARDED_BY(mu);
-  int total GUARDED_BY(mu);
+  port::CondVar cv;
+  int total;
 
   // Each thread goes through the following states:
   //    (1) initializing
@@ -291,12 +283,11 @@ struct SharedState {
   //    (3) running
   //    (4) done
 
-  int num_initialized GUARDED_BY(mu);
-  int num_done GUARDED_BY(mu);
-  bool start GUARDED_BY(mu);
+  int num_initialized;
+  int num_done;
+  bool start;
 
-  SharedState(int total)
-      : cv(&mu), total(total), num_initialized(0), num_done(0), start(false) { }
+  SharedState() : cv(&mu) { }
 };
 
 // Per-thread state for concurrent executions of the same benchmark.
@@ -370,18 +361,18 @@ class Benchmark {
             kMajorVersion, kMinorVersion);
 
 #if defined(__linux)
-    time_t now = time(nullptr);
+    time_t now = time(NULL);
     fprintf(stderr, "Date:       %s", ctime(&now));  // ctime() adds newline
 
     FILE* cpuinfo = fopen("/proc/cpuinfo", "r");
-    if (cpuinfo != nullptr) {
+    if (cpuinfo != NULL) {
       char line[1000];
       int num_cpus = 0;
       std::string cpu_type;
       std::string cache_size;
-      while (fgets(line, sizeof(line), cpuinfo) != nullptr) {
+      while (fgets(line, sizeof(line), cpuinfo) != NULL) {
         const char* sep = strchr(line, ':');
-        if (sep == nullptr) {
+        if (sep == NULL) {
           continue;
         }
         Slice key = TrimSpace(Slice(line, sep - 1 - line));
@@ -402,21 +393,21 @@ class Benchmark {
 
  public:
   Benchmark()
-  : cache_(FLAGS_cache_size >= 0 ? NewLRUCache(FLAGS_cache_size) : nullptr),
+  : cache_(FLAGS_cache_size >= 0 ? NewLRUCache(FLAGS_cache_size) : NULL),
     filter_policy_(FLAGS_bloom_bits >= 0
                    ? NewBloomFilterPolicy(FLAGS_bloom_bits)
-                   : nullptr),
-    db_(nullptr),
+                   : NULL),
+    db_(NULL),
     num_(FLAGS_num),
     value_size_(FLAGS_value_size),
     entries_per_batch_(1),
     reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
     heap_counter_(0) {
     std::vector<std::string> files;
-    g_env->GetChildren(FLAGS_db, &files);
+    Env::Default()->GetChildren(FLAGS_db, &files);
     for (size_t i = 0; i < files.size(); i++) {
       if (Slice(files[i]).starts_with("heap-")) {
-        g_env->DeleteFile(std::string(FLAGS_db) + "/" + files[i]);
+        Env::Default()->DeleteFile(std::string(FLAGS_db) + "/" + files[i]);
       }
     }
     if (!FLAGS_use_existing_db) {
@@ -435,12 +426,12 @@ class Benchmark {
     Open();
 
     const char* benchmarks = FLAGS_benchmarks;
-    while (benchmarks != nullptr) {
+    while (benchmarks != NULL) {
       const char* sep = strchr(benchmarks, ',');
       Slice name;
-      if (sep == nullptr) {
+      if (sep == NULL) {
         name = benchmarks;
-        benchmarks = nullptr;
+        benchmarks = NULL;
       } else {
         name = Slice(benchmarks, sep - benchmarks);
         benchmarks = sep + 1;
@@ -453,7 +444,7 @@ class Benchmark {
       entries_per_batch_ = 1;
       write_options_ = WriteOptions();
 
-      void (Benchmark::*method)(ThreadState*) = nullptr;
+      void (Benchmark::*method)(ThreadState*) = NULL;
       bool fresh_db = false;
       int num_threads = FLAGS_threads;
 
@@ -532,16 +523,16 @@ class Benchmark {
         if (FLAGS_use_existing_db) {
           fprintf(stdout, "%-12s : skipped (--use_existing_db is true)\n",
                   name.ToString().c_str());
-          method = nullptr;
+          method = NULL;
         } else {
           delete db_;
-          db_ = nullptr;
+          db_ = NULL;
           DestroyDB(FLAGS_db, Options());
           Open();
         }
       }
 
-      if (method != nullptr) {
+      if (method != NULL) {
         RunBenchmark(num_threads, name, method);
       }
     }
@@ -585,7 +576,11 @@ class Benchmark {
 
   void RunBenchmark(int n, Slice name,
                     void (Benchmark::*method)(ThreadState*)) {
-    SharedState shared(n);
+    SharedState shared;
+    shared.total = n;
+    shared.num_initialized = 0;
+    shared.num_done = 0;
+    shared.start = false;
 
     ThreadArg* arg = new ThreadArg[n];
     for (int i = 0; i < n; i++) {
@@ -594,7 +589,7 @@ class Benchmark {
       arg[i].shared = &shared;
       arg[i].thread = new ThreadState(i);
       arg[i].thread->shared = &shared;
-      g_env->StartThread(ThreadBody, &arg[i]);
+      Env::Default()->StartThread(ThreadBody, &arg[i]);
     }
 
     shared.mu.Lock();
@@ -643,7 +638,7 @@ class Benchmark {
     int dummy;
     port::AtomicPointer ap(&dummy);
     int count = 0;
-    void *ptr = nullptr;
+    void *ptr = NULL;
     thread->stats.AddMessage("(each op is 1000 loads)");
     while (count < 100000) {
       for (int i = 0; i < 1000; i++) {
@@ -652,7 +647,7 @@ class Benchmark {
       count++;
       thread->stats.FinishedSingleOp();
     }
-    if (ptr == nullptr) exit(1); // Disable unused variable warning.
+    if (ptr == NULL) exit(1); // Disable unused variable warning.
   }
 
   void SnappyCompress(ThreadState* thread) {
@@ -703,14 +698,11 @@ class Benchmark {
   }
 
   void Open() {
-    assert(db_ == nullptr);
+    assert(db_ == NULL);
     Options options;
-    options.env = g_env;
     options.create_if_missing = !FLAGS_use_existing_db;
     options.block_cache = cache_;
     options.write_buffer_size = FLAGS_write_buffer_size;
-    options.max_file_size = FLAGS_max_file_size;
-    options.block_size = FLAGS_block_size;
     options.max_open_files = FLAGS_open_files;
     options.filter_policy = filter_policy_;
     options.reuse_logs = FLAGS_reuse_logs;
@@ -914,7 +906,7 @@ class Benchmark {
   }
 
   void Compact(ThreadState* thread) {
-    db_->CompactRange(nullptr, nullptr);
+    db_->CompactRange(NULL, NULL);
   }
 
   void PrintStats(const char* key) {
@@ -933,7 +925,7 @@ class Benchmark {
     char fname[100];
     snprintf(fname, sizeof(fname), "%s/heap-%04d", FLAGS_db, ++heap_counter_);
     WritableFile* file;
-    Status s = g_env->NewWritableFile(fname, &file);
+    Status s = Env::Default()->NewWritableFile(fname, &file);
     if (!s.ok()) {
       fprintf(stderr, "%s\n", s.ToString().c_str());
       return;
@@ -942,7 +934,7 @@ class Benchmark {
     delete file;
     if (!ok) {
       fprintf(stderr, "heap profiling not supported\n");
-      g_env->DeleteFile(fname);
+      Env::Default()->DeleteFile(fname);
     }
   }
 };
@@ -951,8 +943,6 @@ class Benchmark {
 
 int main(int argc, char** argv) {
   FLAGS_write_buffer_size = leveldb::Options().write_buffer_size;
-  FLAGS_max_file_size = leveldb::Options().max_file_size;
-  FLAGS_block_size = leveldb::Options().block_size;
   FLAGS_open_files = leveldb::Options().max_open_files;
   std::string default_db_path;
 
@@ -983,10 +973,6 @@ int main(int argc, char** argv) {
       FLAGS_value_size = n;
     } else if (sscanf(argv[i], "--write_buffer_size=%d%c", &n, &junk) == 1) {
       FLAGS_write_buffer_size = n;
-    } else if (sscanf(argv[i], "--max_file_size=%d%c", &n, &junk) == 1) {
-      FLAGS_max_file_size = n;
-    } else if (sscanf(argv[i], "--block_size=%d%c", &n, &junk) == 1) {
-      FLAGS_block_size = n;
     } else if (sscanf(argv[i], "--cache_size=%d%c", &n, &junk) == 1) {
       FLAGS_cache_size = n;
     } else if (sscanf(argv[i], "--bloom_bits=%d%c", &n, &junk) == 1) {
@@ -1001,11 +987,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  leveldb::g_env = leveldb::Env::Default();
-
   // Choose a location for the test database if none given with --db=<path>
-  if (FLAGS_db == nullptr) {
-      leveldb::g_env->GetTestDirectory(&default_db_path);
+  if (FLAGS_db == NULL) {
+      leveldb::Env::Default()->GetTestDirectory(&default_db_path);
       default_db_path += "/dbbench";
       FLAGS_db = default_db_path.c_str();
   }

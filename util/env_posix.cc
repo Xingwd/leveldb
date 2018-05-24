@@ -10,61 +10,98 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #include <deque>
-#include <limits>
 #include <set>
 #include "leveldb/env.h"
 #include "leveldb/slice.h"
 #include "port/port.h"
-#include "port/thread_annotations.h"
 #include "util/logging.h"
 #include "util/mutexlock.h"
 #include "util/posix_logger.h"
-#include "util/env_posix_test_helper.h"
-
-// HAVE_FDATASYNC is defined in the auto-generated port_config.h, which is
-// included by port_stdcxx.h.
-#if !HAVE_FDATASYNC
-#define fdatasync fsync
-#endif  // !HAVE_FDATASYNC
 
 namespace leveldb {
 
 namespace {
 
-static int open_read_only_file_limit = -1;
-static int mmap_limit = -1;
-
-static const size_t kBufSize = 65536;
-
-static Status PosixError(const std::string& context, int err_number) {
-  if (err_number == ENOENT) {
-    return Status::NotFound(context, strerror(err_number));
-  } else {
-    return Status::IOError(context, strerror(err_number));
-  }
+static Status IOError(const std::string& context, int err_number) {
+  return Status::IOError(context, strerror(err_number));
 }
 
-// Helper class to limit resource usage to avoid exhaustion.
-// Currently used to limit read-only file descriptors and mmap file usage
-// so that we do not end up running out of file descriptors, virtual memory,
-// or running into kernel performance problems for very large databases.
-class Limiter {
+class PosixSequentialFile: public SequentialFile {
+ private:
+  std::string filename_;
+  FILE* file_;
+
  public:
-  // Limit maximum number of resources to |n|.
-  Limiter(intptr_t n) {
-    SetAllowed(n);
+  PosixSequentialFile(const std::string& fname, FILE* f)
+      : filename_(fname), file_(f) { }
+  virtual ~PosixSequentialFile() { fclose(file_); }
+
+  virtual Status Read(size_t n, Slice* result, char* scratch) {
+    Status s;
+    size_t r = fread_unlocked(scratch, 1, n, file_);
+    *result = Slice(scratch, r);
+    if (r < n) {
+      if (feof(file_)) {
+        // We leave status as ok if we hit the end of the file
+      } else {
+        // A partial read with an error: return a non-ok status
+        s = IOError(filename_, errno);
+      }
+    }
+    return s;
   }
 
-  // If another resource is available, acquire it and return true.
+  virtual Status Skip(uint64_t n) {
+    if (fseek(file_, n, SEEK_CUR)) {
+      return IOError(filename_, errno);
+    }
+    return Status::OK();
+  }
+};
+
+// pread() based random-access
+class PosixRandomAccessFile: public RandomAccessFile {
+ private:
+  std::string filename_;
+  int fd_;
+
+ public:
+  PosixRandomAccessFile(const std::string& fname, int fd)
+      : filename_(fname), fd_(fd) { }
+  virtual ~PosixRandomAccessFile() { close(fd_); }
+
+  virtual Status Read(uint64_t offset, size_t n, Slice* result,
+                      char* scratch) const {
+    Status s;
+    ssize_t r = pread(fd_, scratch, n, static_cast<off_t>(offset));
+    *result = Slice(scratch, (r < 0) ? 0 : r);
+    if (r < 0) {
+      // An error: return a non-ok status
+      s = IOError(filename_, errno);
+    }
+    return s;
+  }
+};
+
+// Helper class to limit mmap file usage so that we do not end up
+// running out virtual memory or running into kernel performance
+// problems for very large databases.
+class MmapLimiter {
+ public:
+  // Up to 1000 mmaps for 64-bit binaries; none for smaller pointer sizes.
+  MmapLimiter() {
+    SetAllowed(sizeof(void*) >= 8 ? 1000 : 0);
+  }
+
+  // If another mmap slot is available, acquire it and return true.
   // Else return false.
-  bool Acquire() LOCKS_EXCLUDED(mu_) {
+  bool Acquire() {
     if (GetAllowed() <= 0) {
       return false;
     }
@@ -78,9 +115,8 @@ class Limiter {
     }
   }
 
-  // Release a resource acquired by a previous call to Acquire() that returned
-  // true.
-  void Release() LOCKS_EXCLUDED(mu_) {
+  // Release a slot acquired by a previous call to Acquire() that returned true.
+  void Release() {
     MutexLock l(&mu_);
     SetAllowed(GetAllowed() + 1);
   }
@@ -93,98 +129,13 @@ class Limiter {
     return reinterpret_cast<intptr_t>(allowed_.Acquire_Load());
   }
 
-  void SetAllowed(intptr_t v) EXCLUSIVE_LOCKS_REQUIRED(mu_) {
+  // REQUIRES: mu_ must be held
+  void SetAllowed(intptr_t v) {
     allowed_.Release_Store(reinterpret_cast<void*>(v));
   }
 
-  Limiter(const Limiter&);
-  void operator=(const Limiter&);
-};
-
-class PosixSequentialFile: public SequentialFile {
- private:
-  std::string filename_;
-  int fd_;
-
- public:
-  PosixSequentialFile(const std::string& fname, int fd)
-      : filename_(fname), fd_(fd) {}
-  virtual ~PosixSequentialFile() { close(fd_); }
-
-  virtual Status Read(size_t n, Slice* result, char* scratch) {
-    Status s;
-    while (true) {
-      ssize_t r = read(fd_, scratch, n);
-      if (r < 0) {
-        if (errno == EINTR) {
-          continue;  // Retry
-        }
-        s = PosixError(filename_, errno);
-        break;
-      }
-      *result = Slice(scratch, r);
-      break;
-    }
-    return s;
-  }
-
-  virtual Status Skip(uint64_t n) {
-    if (lseek(fd_, n, SEEK_CUR) == static_cast<off_t>(-1)) {
-      return PosixError(filename_, errno);
-    }
-    return Status::OK();
-  }
-};
-
-// pread() based random-access
-class PosixRandomAccessFile: public RandomAccessFile {
- private:
-  std::string filename_;
-  bool temporary_fd_;  // If true, fd_ is -1 and we open on every read.
-  int fd_;
-  Limiter* limiter_;
-
- public:
-  PosixRandomAccessFile(const std::string& fname, int fd, Limiter* limiter)
-      : filename_(fname), fd_(fd), limiter_(limiter) {
-    temporary_fd_ = !limiter->Acquire();
-    if (temporary_fd_) {
-      // Open file on every access.
-      close(fd_);
-      fd_ = -1;
-    }
-  }
-
-  virtual ~PosixRandomAccessFile() {
-    if (!temporary_fd_) {
-      close(fd_);
-      limiter_->Release();
-    }
-  }
-
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      char* scratch) const {
-    int fd = fd_;
-    if (temporary_fd_) {
-      fd = open(filename_.c_str(), O_RDONLY);
-      if (fd < 0) {
-        return PosixError(filename_, errno);
-      }
-    }
-
-    Status s;
-    ssize_t r = pread(fd, scratch, n, static_cast<off_t>(offset));
-    *result = Slice(scratch, (r < 0) ? 0 : r);
-    if (r < 0) {
-      // An error: return a non-ok status
-      s = PosixError(filename_, errno);
-    }
-    if (temporary_fd_) {
-      // Close the temporary file descriptor opened earlier.
-      close(fd);
-    }
-    return s;
-  }
+  MmapLimiter(const MmapLimiter&);
+  void operator=(const MmapLimiter&);
 };
 
 // mmap() based random-access
@@ -193,12 +144,12 @@ class PosixMmapReadableFile: public RandomAccessFile {
   std::string filename_;
   void* mmapped_region_;
   size_t length_;
-  Limiter* limiter_;
+  MmapLimiter* limiter_;
 
  public:
   // base[0,length-1] contains the mmapped contents of the file.
   PosixMmapReadableFile(const std::string& fname, void* base, size_t length,
-                        Limiter* limiter)
+                        MmapLimiter* limiter)
       : filename_(fname), mmapped_region_(base), length_(length),
         limiter_(limiter) {
   }
@@ -213,7 +164,7 @@ class PosixMmapReadableFile: public RandomAccessFile {
     Status s;
     if (offset + n > length_) {
       *result = Slice();
-      s = PosixError(filename_, EINVAL);
+      s = IOError(filename_, EINVAL);
     } else {
       *result = Slice(reinterpret_cast<char*>(mmapped_region_) + offset, n);
     }
@@ -223,64 +174,42 @@ class PosixMmapReadableFile: public RandomAccessFile {
 
 class PosixWritableFile : public WritableFile {
  private:
-  // buf_[0, pos_-1] contains data to be written to fd_.
   std::string filename_;
-  int fd_;
-  char buf_[kBufSize];
-  size_t pos_;
+  FILE* file_;
 
  public:
-  PosixWritableFile(const std::string& fname, int fd)
-      : filename_(fname), fd_(fd), pos_(0) { }
+  PosixWritableFile(const std::string& fname, FILE* f)
+      : filename_(fname), file_(f) { }
 
   ~PosixWritableFile() {
-    if (fd_ >= 0) {
+    if (file_ != NULL) {
       // Ignoring any potential errors
-      Close();
+      fclose(file_);
     }
   }
 
   virtual Status Append(const Slice& data) {
-    size_t n = data.size();
-    const char* p = data.data();
-
-    // Fit as much as possible into buffer.
-    size_t copy = std::min(n, kBufSize - pos_);
-    memcpy(buf_ + pos_, p, copy);
-    p += copy;
-    n -= copy;
-    pos_ += copy;
-    if (n == 0) {
-      return Status::OK();
+    size_t r = fwrite_unlocked(data.data(), 1, data.size(), file_);
+    if (r != data.size()) {
+      return IOError(filename_, errno);
     }
-
-    // Can't fit in buffer, so need to do at least one write.
-    Status s = FlushBuffered();
-    if (!s.ok()) {
-      return s;
-    }
-
-    // Small writes go to buffer, large writes are written directly.
-    if (n < kBufSize) {
-      memcpy(buf_, p, n);
-      pos_ = n;
-      return Status::OK();
-    }
-    return WriteRaw(p, n);
+    return Status::OK();
   }
 
   virtual Status Close() {
-    Status result = FlushBuffered();
-    const int r = close(fd_);
-    if (r < 0 && result.ok()) {
-      result = PosixError(filename_, errno);
+    Status result;
+    if (fclose(file_) != 0) {
+      result = IOError(filename_, errno);
     }
-    fd_ = -1;
+    file_ = NULL;
     return result;
   }
 
   virtual Status Flush() {
-    return FlushBuffered();
+    if (fflush_unlocked(file_) != 0) {
+      return IOError(filename_, errno);
+    }
+    return Status::OK();
   }
 
   Status SyncDirIfManifest() {
@@ -288,7 +217,7 @@ class PosixWritableFile : public WritableFile {
     const char* sep = strrchr(f, '/');
     Slice basename;
     std::string dir;
-    if (sep == nullptr) {
+    if (sep == NULL) {
       dir = ".";
       basename = f;
     } else {
@@ -299,10 +228,10 @@ class PosixWritableFile : public WritableFile {
     if (basename.starts_with("MANIFEST")) {
       int fd = open(dir.c_str(), O_RDONLY);
       if (fd < 0) {
-        s = PosixError(dir, errno);
+        s = IOError(dir, errno);
       } else {
         if (fsync(fd) < 0) {
-          s = PosixError(dir, errno);
+          s = IOError(dir, errno);
         }
         close(fd);
       }
@@ -316,35 +245,11 @@ class PosixWritableFile : public WritableFile {
     if (!s.ok()) {
       return s;
     }
-    s = FlushBuffered();
-    if (s.ok()) {
-      if (fdatasync(fd_) != 0) {
-        s = PosixError(filename_, errno);
-      }
+    if (fflush_unlocked(file_) != 0 ||
+        fdatasync(fileno(file_)) != 0) {
+      s = Status::IOError(filename_, strerror(errno));
     }
     return s;
-  }
-
- private:
-  Status FlushBuffered() {
-    Status s = WriteRaw(buf_, pos_);
-    pos_ = 0;
-    return s;
-  }
-
-  Status WriteRaw(const char* p, size_t n) {
-    while (n > 0) {
-      ssize_t r = write(fd_, p, n);
-      if (r < 0) {
-        if (errno == EINTR) {
-          continue;  // Retry
-        }
-        return PosixError(filename_, errno);
-      }
-      p += r;
-      n -= r;
-    }
-    return Status::OK();
   }
 };
 
@@ -371,13 +276,13 @@ class PosixFileLock : public FileLock {
 class PosixLockTable {
  private:
   port::Mutex mu_;
-  std::set<std::string> locked_files_ GUARDED_BY(mu_);
+  std::set<std::string> locked_files_;
  public:
-  bool Insert(const std::string& fname) LOCKS_EXCLUDED(mu_) {
+  bool Insert(const std::string& fname) {
     MutexLock l(&mu_);
     return locked_files_.insert(fname).second;
   }
-  void Remove(const std::string& fname) LOCKS_EXCLUDED(mu_) {
+  void Remove(const std::string& fname) {
     MutexLock l(&mu_);
     locked_files_.erase(fname);
   }
@@ -394,32 +299,32 @@ class PosixEnv : public Env {
 
   virtual Status NewSequentialFile(const std::string& fname,
                                    SequentialFile** result) {
-    int fd = open(fname.c_str(), O_RDONLY);
-    if (fd < 0) {
-      *result = nullptr;
-      return PosixError(fname, errno);
+    FILE* f = fopen(fname.c_str(), "r");
+    if (f == NULL) {
+      *result = NULL;
+      return IOError(fname, errno);
     } else {
-      *result = new PosixSequentialFile(fname, fd);
+      *result = new PosixSequentialFile(fname, f);
       return Status::OK();
     }
   }
 
   virtual Status NewRandomAccessFile(const std::string& fname,
                                      RandomAccessFile** result) {
-    *result = nullptr;
+    *result = NULL;
     Status s;
     int fd = open(fname.c_str(), O_RDONLY);
     if (fd < 0) {
-      s = PosixError(fname, errno);
+      s = IOError(fname, errno);
     } else if (mmap_limit_.Acquire()) {
       uint64_t size;
       s = GetFileSize(fname, &size);
       if (s.ok()) {
-        void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        void* base = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
         if (base != MAP_FAILED) {
           *result = new PosixMmapReadableFile(fname, base, size, &mmap_limit_);
         } else {
-          s = PosixError(fname, errno);
+          s = IOError(fname, errno);
         }
       }
       close(fd);
@@ -427,7 +332,7 @@ class PosixEnv : public Env {
         mmap_limit_.Release();
       }
     } else {
-      *result = new PosixRandomAccessFile(fname, fd, &fd_limit_);
+      *result = new PosixRandomAccessFile(fname, fd);
     }
     return s;
   }
@@ -435,12 +340,12 @@ class PosixEnv : public Env {
   virtual Status NewWritableFile(const std::string& fname,
                                  WritableFile** result) {
     Status s;
-    int fd = open(fname.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) {
-      *result = nullptr;
-      s = PosixError(fname, errno);
+    FILE* f = fopen(fname.c_str(), "w");
+    if (f == NULL) {
+      *result = NULL;
+      s = IOError(fname, errno);
     } else {
-      *result = new PosixWritableFile(fname, fd);
+      *result = new PosixWritableFile(fname, f);
     }
     return s;
   }
@@ -448,12 +353,12 @@ class PosixEnv : public Env {
   virtual Status NewAppendableFile(const std::string& fname,
                                    WritableFile** result) {
     Status s;
-    int fd = open(fname.c_str(), O_APPEND | O_WRONLY | O_CREAT, 0644);
-    if (fd < 0) {
-      *result = nullptr;
-      s = PosixError(fname, errno);
+    FILE* f = fopen(fname.c_str(), "a");
+    if (f == NULL) {
+      *result = NULL;
+      s = IOError(fname, errno);
     } else {
-      *result = new PosixWritableFile(fname, fd);
+      *result = new PosixWritableFile(fname, f);
     }
     return s;
   }
@@ -466,11 +371,11 @@ class PosixEnv : public Env {
                              std::vector<std::string>* result) {
     result->clear();
     DIR* d = opendir(dir.c_str());
-    if (d == nullptr) {
-      return PosixError(dir, errno);
+    if (d == NULL) {
+      return IOError(dir, errno);
     }
     struct dirent* entry;
-    while ((entry = readdir(d)) != nullptr) {
+    while ((entry = readdir(d)) != NULL) {
       result->push_back(entry->d_name);
     }
     closedir(d);
@@ -480,7 +385,7 @@ class PosixEnv : public Env {
   virtual Status DeleteFile(const std::string& fname) {
     Status result;
     if (unlink(fname.c_str()) != 0) {
-      result = PosixError(fname, errno);
+      result = IOError(fname, errno);
     }
     return result;
   }
@@ -488,7 +393,7 @@ class PosixEnv : public Env {
   virtual Status CreateDir(const std::string& name) {
     Status result;
     if (mkdir(name.c_str(), 0755) != 0) {
-      result = PosixError(name, errno);
+      result = IOError(name, errno);
     }
     return result;
   }
@@ -496,7 +401,7 @@ class PosixEnv : public Env {
   virtual Status DeleteDir(const std::string& name) {
     Status result;
     if (rmdir(name.c_str()) != 0) {
-      result = PosixError(name, errno);
+      result = IOError(name, errno);
     }
     return result;
   }
@@ -506,7 +411,7 @@ class PosixEnv : public Env {
     struct stat sbuf;
     if (stat(fname.c_str(), &sbuf) != 0) {
       *size = 0;
-      s = PosixError(fname, errno);
+      s = IOError(fname, errno);
     } else {
       *size = sbuf.st_size;
     }
@@ -516,22 +421,22 @@ class PosixEnv : public Env {
   virtual Status RenameFile(const std::string& src, const std::string& target) {
     Status result;
     if (rename(src.c_str(), target.c_str()) != 0) {
-      result = PosixError(src, errno);
+      result = IOError(src, errno);
     }
     return result;
   }
 
   virtual Status LockFile(const std::string& fname, FileLock** lock) {
-    *lock = nullptr;
+    *lock = NULL;
     Status result;
     int fd = open(fname.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd < 0) {
-      result = PosixError(fname, errno);
+      result = IOError(fname, errno);
     } else if (!locks_.Insert(fname)) {
       close(fd);
       result = Status::IOError("lock " + fname, "already held by process");
     } else if (LockOrUnlock(fd, true) == -1) {
-      result = PosixError("lock " + fname, errno);
+      result = IOError("lock " + fname, errno);
       close(fd);
       locks_.Remove(fname);
     } else {
@@ -547,7 +452,7 @@ class PosixEnv : public Env {
     PosixFileLock* my_lock = reinterpret_cast<PosixFileLock*>(lock);
     Status result;
     if (LockOrUnlock(my_lock->fd_, false) == -1) {
-      result = PosixError("unlock", errno);
+      result = IOError("unlock", errno);
     }
     locks_.Remove(my_lock->name_);
     close(my_lock->fd_);
@@ -582,9 +487,9 @@ class PosixEnv : public Env {
 
   virtual Status NewLogger(const std::string& fname, Logger** result) {
     FILE* f = fopen(fname.c_str(), "w");
-    if (f == nullptr) {
-      *result = nullptr;
-      return PosixError(fname, errno);
+    if (f == NULL) {
+      *result = NULL;
+      return IOError(fname, errno);
     } else {
       *result = new PosixLogger(f, &PosixEnv::gettid);
       return Status::OK();
@@ -593,7 +498,7 @@ class PosixEnv : public Env {
 
   virtual uint64_t NowMicros() {
     struct timeval tv;
-    gettimeofday(&tv, nullptr);
+    gettimeofday(&tv, NULL);
     return static_cast<uint64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
   }
 
@@ -613,7 +518,7 @@ class PosixEnv : public Env {
   void BGThread();
   static void* BGThreadWrapper(void* arg) {
     reinterpret_cast<PosixEnv*>(arg)->BGThread();
-    return nullptr;
+    return NULL;
   }
 
   pthread_mutex_t mu_;
@@ -627,44 +532,12 @@ class PosixEnv : public Env {
   BGQueue queue_;
 
   PosixLockTable locks_;
-  Limiter mmap_limit_;
-  Limiter fd_limit_;
+  MmapLimiter mmap_limit_;
 };
 
-// Return the maximum number of concurrent mmaps.
-static int MaxMmaps() {
-  if (mmap_limit >= 0) {
-    return mmap_limit;
-  }
-  // Up to 1000 mmaps for 64-bit binaries; none for smaller pointer sizes.
-  mmap_limit = sizeof(void*) >= 8 ? 1000 : 0;
-  return mmap_limit;
-}
-
-// Return the maximum number of read-only files to keep open.
-static intptr_t MaxOpenFiles() {
-  if (open_read_only_file_limit >= 0) {
-    return open_read_only_file_limit;
-  }
-  struct rlimit rlim;
-  if (getrlimit(RLIMIT_NOFILE, &rlim)) {
-    // getrlimit failed, fallback to hard-coded default.
-    open_read_only_file_limit = 50;
-  } else if (rlim.rlim_cur == RLIM_INFINITY) {
-    open_read_only_file_limit = std::numeric_limits<int>::max();
-  } else {
-    // Allow use of 20% of available file descriptors for read-only files.
-    open_read_only_file_limit = rlim.rlim_cur / 5;
-  }
-  return open_read_only_file_limit;
-}
-
-PosixEnv::PosixEnv()
-    : started_bgthread_(false),
-      mmap_limit_(MaxMmaps()),
-      fd_limit_(MaxOpenFiles()) {
-  PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
-  PthreadCall("cvar_init", pthread_cond_init(&bgsignal_, nullptr));
+PosixEnv::PosixEnv() : started_bgthread_(false) {
+  PthreadCall("mutex_init", pthread_mutex_init(&mu_, NULL));
+  PthreadCall("cvar_init", pthread_cond_init(&bgsignal_, NULL));
 }
 
 void PosixEnv::Schedule(void (*function)(void*), void* arg) {
@@ -675,7 +548,7 @@ void PosixEnv::Schedule(void (*function)(void*), void* arg) {
     started_bgthread_ = true;
     PthreadCall(
         "create thread",
-        pthread_create(&bgthread_, nullptr,  &PosixEnv::BGThreadWrapper, this));
+        pthread_create(&bgthread_, NULL,  &PosixEnv::BGThreadWrapper, this));
   }
 
   // If the queue is currently empty, the background thread may currently be
@@ -719,7 +592,7 @@ static void* StartThreadWrapper(void* arg) {
   StartThreadState* state = reinterpret_cast<StartThreadState*>(arg);
   state->user_function(state->arg);
   delete state;
-  return nullptr;
+  return NULL;
 }
 
 void PosixEnv::StartThread(void (*function)(void* arg), void* arg) {
@@ -728,7 +601,7 @@ void PosixEnv::StartThread(void (*function)(void* arg), void* arg) {
   state->user_function = function;
   state->arg = arg;
   PthreadCall("start thread",
-              pthread_create(&t, nullptr,  &StartThreadWrapper, state));
+              pthread_create(&t, NULL,  &StartThreadWrapper, state));
 }
 
 }  // namespace
@@ -736,16 +609,6 @@ void PosixEnv::StartThread(void (*function)(void* arg), void* arg) {
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static Env* default_env;
 static void InitDefaultEnv() { default_env = new PosixEnv; }
-
-void EnvPosixTestHelper::SetReadOnlyFDLimit(int limit) {
-  assert(default_env == nullptr);
-  open_read_only_file_limit = limit;
-}
-
-void EnvPosixTestHelper::SetReadOnlyMMapLimit(int limit) {
-  assert(default_env == nullptr);
-  mmap_limit = limit;
-}
 
 Env* Env::Default() {
   pthread_once(&once, InitDefaultEnv);
